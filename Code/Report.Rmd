@@ -1,0 +1,305 @@
+---
+title: "Immigration and Wages in the USA: A State-Level Exploratory Analysis."
+author: "Jennifer"
+date: "2026-04-06"
+output: html_document
+---
+
+
+## Topic, Motivation, and Data
+
+## Research Topic
+This topic investigates the relationship between immigration and wages in the United States, examined at the state level using multiple decades of data (1970, 1980, 1990, 2000, 2010, 2020). The central question is whether immigration affects wage levels — specifically, whether an increase in the immigrant workforce leads to higher or lower wages for workers.
+
+#Research questions
+(Descriptive)How do average wages differ between immigrants and native born workers across states in the United States?
+How does the immigrant share vary across states, and how is it associated with differences in average wages across states?To what extent are differences in wages across states driven by differences in worker characteristics, such as education, rather than immigration itself? Answered w/ fig 2
+(Causal) Does a higher immigrant share in a state cause wages to increase or decrease for workers in that state?
+
+## Motivation
+Immigration has been one of the most debated economic and political issues in the United States. Labor economists have long studied whether immigration complements or competes with native workers (Borjas 1987; Card 1990; Peri 2012). The empirical evidence is complicated because immigrants are not randomly distributed across locations — they tend to move to high-wage, high-opportunity areas, creating a selection problem. The inclusion of multiple decades of data allows for the examination of changes in immigration patterns over time, including the role of major policy shifts.
+
+## Data
+The data come from the Current Population Survey (CPS) ASEC supplement, accessed through IPUMS CPS (Flood et al. 2023). The CPS is the primary source of labor force and earnings data in the United States and is conducted monthly by the Census Bureau and the Bureau of Labor Statistics. The ASEC supplement (Annual Social and Economic Supplement), administered each March, includes detailed earnings information not available in the monthly survey.
+
+The dataset covers the years 1970, 1980, 1990, 2000, 2010, and 2020. However, the key variables for this analysis — weekly earnings (EARNWEEK) and immigration status (NATIVITY) — are only simultaneously available in 2000, 2010, and 2020, which form the core analysis sample. The earlier years are retained to examine immigration-related policy shocks and broader historical trends. The raw extract contains 986,061 observations across 21 variables.
+
+Key variables used in this analysis:
+EARNWEEK: Usual weekly earnings on the primary job
+NATIVITY: Immigration status (native vs. foreign-born)
+STATEFIP: State FIPS code
+ASECWT: Person-level survey weight
+AGE
+SEX
+EDUC: Educational attainment
+EMPSTAT: Employment status
+
+
+## Data Cleaning
+Variable selection and renaming. I selected 13 variables relevant to the analysis and renamed them foe easy identification. All other columns were dropped.
+
+Primary key verification. Each row is uniquely identified by (year, serial, pernum). I confirmed zero duplicate combinations, establishing the row as a valid person-year record.
+
+Recoding categorical variables. The binary immigrant indicator was constructed from IPUMS's NATIVITY code: values 1–3 (native-born in the US, abroad to American parents, or in a US territory) were coded 0; values 4–5 (foreign-born citizens and non-citizens) were coded 1; and code 0 (not collected, appearing only in pre-2000 waves) was set to NA. This native vs. foreign-born distinction follows the standard used in the immigration economics literature. Employment status was recoded to a binary (employed = EMPSTAT codes 10 or 12). Education was collapsed from fine-grained IPUMS codes into four ordered tiers: less than high school, high school diploma, some college, and bachelor's degree or more.
+
+State crosswalk. A manual crosswalk was joined to the FIPS codes to add state abbreviations and full names used in figure labels.
+
+Unit of analysis. The final cleaned, aggregated dataset contains one row per state × year combination. Each row summarizes the weighted characteristics of the employed civilian workforce (ages 25–64) of that state in that year. The individual-level file is retained for distributional plots. There are r nrow(state_yr) state-year cells across r n_distinct(state_yr$state_abb) states and 3 years.
+
+Missing Data and Sentinel Values
+
+The CPS data required careful treatment of IPUMS-specific sentinel values — special numeric codes used to indicate "not applicable" rather than true missing data.
+
+Weekly earnings (EARNWEEK). The value 9999.99 serves as a dual sentinel in this extract: it indicates either that the respondent was not part of the ASEC supplement (and was never asked the earnings question) or that their earnings were top-coded at the survey's maximum. I converted all 9999.99 values to NA. Approximately 94% of all rows are missing earn_week — this is expected and not a data quality problem; it simply reflects the survey design and the focus on employed ASEC respondents.
+
+Usual hours worked (UHRSWORKT). The values 999 ("not applicable") and 997 ("hours vary") were both converted to NA. Because weekly earnings are used rather than hourly wages as the primary outcome, the loss of hours information does not compromise the core analysis.
+
+Sample restrictions. The sample is restricted to: (1) years 2000, 2010, and 2020 — the only years where both EARNWEEK and NATIVITY are available; (2) working-age adults 25–64; (3) employed civilians (EMPSTAT 10 or 12); (4) individuals with positive observed weekly earnings; (5) positive survey weights; and (6) the 50 states plus DC (excluding US territories). These restrictions reduce the dataset from 986,061 rows to r scales::comma(nrow(ind)) observations.
+
+Transformations and Extreme Values
+
+Weekly earnings are strongly right-skewed (Figure 1 below): the median is around $700 but a long upper tail pulls the mean above $1,000. A natural log transformation is applied to weekly earnings (ln_earn = log(earn_week)). This transformation is standard in labor economics (originating in the Mincer 1974 earnings equation) for three reasons: (1) it addresses the right skew; (2) coefficient estimates have a proportional/percentage interpretation; and (3) it reduces the influence of extreme high earners on the mean without arbitrarily dropping them.
+
+Extreme earners are not dropped. The 99th percentile of weekly earnings in the working sample is round(quantile(ind$earn_week, 0.99)). These observations represent genuinely high earners in the data (physicians, lawyers, executives); dropping them would introduce selection bias. Instead, observations above the 99th percentile are flagged using a dummy variable earn_extreme, and robustness to their inclusion will be examined in later analysis.
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F, warning = FALSE,
+  message = FALSE)
+# PACKAGES AND DATA
+# -----------------------------------------------------------------------------
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+# Install the latest binary version (no compilation needed)
+install.packages("rlang", type = "binary")
+
+# Reinstall packages that depend on rlang
+install.packages(c("patchwork", "ggrepel", "scales"), type = "binary")
+
+library(tidyverse)     
+library(scales)       
+library(ggrepel)  
+library(patchwork)    
+library(RColorBrewer) 
+library(ggplot2)
+```
+
+
+```{r}
+# Load cleaned data produced by 01_clean.R:
+ind      <- read_csv("cps_individual_clean.csv", col_types = cols())
+state_yr <- read_csv("cps_state_year.csv",        col_types = cols())
+
+# Convenience: year and educ_cat as factors for categorical plotting
+ind <- ind |>
+  mutate(
+    year_f    = factor(year),
+    educ_cat  = factor(educ_cat,
+                       levels = c("less_hs","hs","some_college","college_plus"),
+                       ordered = TRUE),
+    imm_label = if_else(immigrant == 1, "Immigrant", "Native-born")
+  )
+
+state_yr <- state_yr |>
+  mutate(year_f = factor(year))
+
+
+
+# A shared theme we apply to every figure for a consistent look:
+theme_project <- theme_classic(base_size = 12) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 13),
+    plot.subtitle = element_text(color = "gray40", size = 10),
+    plot.caption  = element_text(color = "gray50", size = 8, hjust = 0),
+    legend.position = "bottom",
+    strip.text    = element_text(face = "bold")
+  )
+
+```
+
+## Exploratory Analysis
+```{r}
+# ── Figure 1: Overlapping Density — wages by immigration status over time ───
+# Density plots (rather than histograms) are better for comparing two groups.
+# Faceting by year shows whether the gap has grown, shrunk, or persisted.
+#  using alpha transparency so both groups are visible where they overlap.
+
+fig1 <- ggplot(ind, aes(x = ln_earn, fill = imm_label, color = imm_label)) +
+  geom_density(alpha = 0.30, adjust = 1.2, linewidth = 0.8) +
+  scale_fill_manual(
+    values = c("Immigrant" = "#D6604D", "Native-born" = "#2166AC"),
+    name = NULL
+  ) +
+  scale_color_manual(
+    values = c("Immigrant" = "#D6604D", "Native-born" = "#2166AC"),
+    name = NULL
+  ) +
+  facet_wrap(~ year_f, ncol = 3) +
+  labs(
+    title    = "Figure 1. Distribution of Log Weekly Earnings by Immigration Status",
+    subtitle = "Employed civilians aged 25–64. Vertical spread = density, not count.",
+    x        = "Log Weekly Earnings",
+    y        = "Density",
+    caption  = paste("Source: IPUMS CPS.",
+                     "Distributions are unweighted; survey weights used in quantitative summaries.")
+  ) +
+  theme_project +
+  theme(legend.position = "top")
+
+print(fig1)
+ggsave("fig1_earnings_density_by_status.png", fig1, width = 10, height = 5, dpi = 150)
+
+
+```
+
+Figure 1 shows overlapping density estimates of log weekly earnings for immigrant and native born workers in each of the three survey years. The immigrant distribution sits to the left of the native born distribution across all years, indicating that immigrants on average earn less than comparable native born workers. However, the distributions overlap substantially, and there are many high earning immigrants and many lower earning native born workers. The gap does not appear to have widened dramatically from 2000 to 2020, though a more precise assessment will be provided in the regression analysis in Stage 3.
+
+```{r}
+# ── Figure 2: Cleveland Dot Plot — earnings gap by education level ──────────
+#  Cleveland dot plots are cleaner than bar charts when
+# the baseline does not have a meaningful zero.
+#
+# This figure shows the earnings gap conditional on education — a first,
+# visual "control" that helps assess whether any gap is just because
+# immigrants and natives have different education compositions.
+
+educ_wage <- ind |>
+  filter(!is.na(educ_cat)) |>
+  group_by(year, educ_cat, imm_label) |>
+  summarise(
+    mean_ln = weighted.mean(ln_earn, weight, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(
+    educ_label = recode(educ_cat,
+                        less_hs       = "< High School",
+                        hs            = "High School",
+                        some_college  = "Some College",
+                        college_plus  = "College+")
+  )
+
+fig2 <- ggplot(educ_wage,
+               aes(x = mean_ln, y = educ_label, color = imm_label,
+                   group = imm_label)) +
+  geom_line(aes(group = educ_label), color = "gray70", linewidth = 0.6) +
+  geom_point(size = 3) +
+  scale_color_manual(
+    values = c("Immigrant" = "#D6604D", "Native-born" = "#2166AC"),
+    name = NULL
+  ) +
+  facet_wrap(~ year, ncol = 3) +
+  labs(
+    title    = "Figure 2. Mean Log Earnings by Education Level and Immigration Status",
+    subtitle = "Connected lines show the within-education earnings gap (native vs. immigrant).",
+    x        = "Mean Log Weekly Earnings",
+    y        = NULL,
+    caption  = "Source: IPUMS CPS. Survey-weighted means. Employed civilians aged 25–64."
+  ) +
+  theme_project +
+  theme(legend.position = "top")
+
+print(fig2)
+ggsave("fig2_educ_earnings_gap.png", fig2, width = 11, height = 6, dpi = 150)
+
+
+```
+
+Figure 2 decomposes the earnings gap by education level, an important first step toward understanding whether the gap is driven by compositional differences. Within each education tier, immigrants earn less than native born workers. The gap is largest at the bottom of the education distribution, less than high school, and nearly disappears among college graduates.
+
+## Is there a visible association between immigrant workforce concentration and wage levels across states
+```{r}
+# =============================================================================
+# THE CORE RELATIONSHIP — IMMIGRANT SHARE AND WAGES ACROSS STATES
+# =============================================================================
+# This is the central figure of my topic: do states with higher immigrant shares tend to have higher or lower wages?
+
+#NOT a causal effect.
+
+# ── Figure 3: Scatterplot — immigrant share vs. mean log wages by state ─────
+# Size = workforce so large states don't get equal visual weight as small ones.
+# OLS line added to summarize the central tendency.
+
+fig3 <- ggplot(state_yr,
+               aes(x = immigrant_share, y = mean_ln_earn, color = year_f)) +
+  geom_point(aes(size = n_weighted / 1e5), alpha = 0.65) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 0.9) +
+  geom_text_repel(
+    data = state_yr |>
+      filter(state_abb %in% c("CA","TX","NY","FL","MT","ND","MS","WV","NJ","HI")),
+    aes(label = state_abb),
+    size = 2.8, show.legend = FALSE, max.overlaps = 20
+  ) +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  scale_color_brewer(palette = "Set1", name = "Year") +
+  scale_size_continuous(
+    name   = "Workforce\n(100k workers)",
+    range  = c(1, 8),
+    guide  = guide_legend(override.aes = list(alpha = 1))
+  ) +
+  facet_wrap(~ year, ncol = 3) +
+  labs(
+    title    = "Figure 3. Immigrant Workforce Share vs. Mean Log Wages Across States",
+    subtitle  = paste("Each point = one state. Size = relative workforce.",
+                      "OLS line summarizes the cross-sectional association."),
+    x        = "Immigrant Share of Employed Workers",
+    y        = "Mean Log Weekly Earnings",
+    caption  = paste("Source: IPUMS CPS. Survey-weighted. Employed civilians aged 25–64.",
+                     "\nNote: A positive association does not imply that immigration raises wages;",
+                     "immigrants may sort into high-wage labor markets.")
+  ) +
+  theme_project +
+  theme(legend.position = "right")
+
+print(fig3)
+ggsave("fig3_scatter_share_wages.png", fig3, width = 12, height = 5, dpi = 150)
+ 
+```
+
+This figure plots the relationship between immigrant workforce share (x-axis) and mean log weekly earnings (y-axis) for each U.S. state,separately for three cross-sections: 2000, 2010, and 2020. Each point is one state. Bubble size reflects the absolute size of the state workforce. An OLS fitted line summarizes the cross-sectional association in each year. The OLS fitted line slopes upward in all three years states with higher immigrant shares tend to have higher mean wages. California, New Jersey, and New York sit in the upper right (high immigrant share, high wages) while West Virginia and Montana sit in the lower left (low immigrant share, low wages). The positive slope steepens noticeably from 2000 to 2020. The upward slope almost certainly does not mean immigrants raise wages. It reflects the fact that immigrants sort into high-wage, economically dynamic states — Example it could be the case that   New York and California attract immigrants because their labor markets are already productive and well-paying, not the other way around. Thats the econometric issue  will address in stage 3.
+
+
+
+## changed in immigrant workforce share over the study period in each state
+```{r}
+# =============================================================================
+# Change in immigrant share 2000→2020, by state
+# =============================================================================
+# Showing *change* rather than levels is useful for panel analyses.
+# This plot visualizes which states experienced the biggest shifts.
+
+share_change <- state_yr |>
+  select(state_abb, year, immigrant_share) |>
+  pivot_wider(names_from = year, values_from = immigrant_share,
+              names_prefix = "share_") |>
+  mutate(
+    change_00_20 = share_2020 - share_2000,
+    state_abb    = reorder(state_abb, change_00_20)
+  ) |>
+  filter(!is.na(change_00_20))
+
+fig_bonus <- ggplot(share_change,
+                    aes(x = change_00_20, y = state_abb,
+                        fill = change_00_20 > 0)) +
+  geom_col(width = 0.7) +
+  geom_vline(xintercept = 0, color = "gray30", linewidth = 0.5) +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  scale_fill_manual(values = c("TRUE"  = "#2166AC",
+                               "FALSE" = "#D6604D"),
+                    guide  = "none") +
+  labs(
+    title   = "Figure 4. Change in Immigrant Workforce Share, 2000–2020 (by State)",
+    subtitle = "Blue = increase; Red = decrease. All states saw immigrant share grow.",
+    x       = "Percentage-Point Change in Immigrant Share",
+    y       = NULL,
+    caption = "Source: IPUMS CPS. Survey-weighted. Employed civilians aged 25–64."
+  ) +
+  theme_project +
+  theme(axis.text.y = element_text(size = 7))
+
+print(fig_bonus)
+ggsave("fig4_change_immigrant_share.png", fig_bonus, width = 8, height = 10, dpi = 150)
+
+```
+
+It calculates how much the immigrant share of employed workers changed in each state between 2000 and 2020, then plots those changes as a horizontal bar chart ranked from largest to smallest(cross-state heterogeneity in immigrant labor supply growth). Immigrant workforce penetration increased in nearly every U.S.state between 2000 and 2020, but at markedly different rates.Virginia and Georgia experienced the largest increases, of approximately 17 percentage points, while most states clustered in the 2–7 percentage point range. A small number of states —notably Hawaii 
+
