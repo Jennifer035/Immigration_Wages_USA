@@ -1,0 +1,736 @@
+---
+title: "Immigration and Wages in the USA: A State-Level Exploratory Analysis."
+author: "Jennifer"
+date: "2026-04-29"
+output: html_document
+---
+
+
+## Motivation
+Immigration has been one of the most debated economic and political issues in the United States. Labor economists have long studied whether immigration complements or competes with native workers (Borjas 1987; Card 1990; Peri 2012). The empirical evidence is complicated because immigrants are not randomly distributed across locations — they tend to move to high-wage, high-opportunity areas, creating a selection problem. The inclusion of multiple decades of data allows for the examination of changes in immigration patterns over time, including the role of major policy shifts.
+
+
+## Research Question
+(Causal) Does a higher immigrant share in a state cause wages to increase or decrease for workers in that state?
+This question matters because immigration policy affects millions and should be guided by solid evidence on labor market impacts. The immigrant share of the U.S. workforce rose from 9.4% in 2000 to 13.7% in 2020, alongside changes in wage inequality, yet economists still disagree on the effect on wages. Montana provides a useful contrast with a low immigrant share (3.5% in 2020), compared to high-immigration states like California (46.5%) and New York (38.3%). Comparing these regions helps assess whether higher immigration is associated with higher wages—and whether the relationship is causal or coincidental, informing policy debates in both high- and low-immigration areas.
+
+
+## Research Question Type: Why This Is a Causal Question
+This study asks a causal question, whether changes in immigrant share cause changes in wages—rather than a descriptive or predictive one. A descriptive approach would only measure correlation between immigration and wages, without explaining causation. A predictive approach would focus on forecasting wages using any correlated variables, regardless of their economic meaning. In contrast, this analysis aims to identify the true causal effect, which is essential for policy decisions. To do this, it isolates variation in immigrant share that is unrelated to wage determinants, using a shift-share instrumental variable.
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,      # hide all R code in the knitted report
+  warning = FALSE,   # hide warning messages
+  message = FALSE    # hide package/startup messages
+)
+
+options(encoding = "UTF-8")
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+```
+
+
+```{r packages, include=FALSE}
+#PACKAGES
+library(kableExtra)
+library(data.table)
+library(tidyverse)    # data wrangling and ggplot2
+library(fixest)       # fast OLS + 2SLS with fixed effects (feols, feiv)
+#library(modelsummary) # publication-quality regression tables
+library(scales)       # percent_format for axis labels
+library(ggrepel)      # geom_text_repel for scatter labels
+library(dplyr)
+```
+
+```{r interpretation-helpers, include=FALSE}
+# Helper functions used only to print clean interpretation paragraphs.
+get_fixest_term <- function(model, term) {
+  ct <- as.data.frame(fixest::coeftable(model))
+  if (!term %in% rownames(ct)) {
+    return(NULL)
+  }
+  out <- ct[term, , drop = FALSE]
+  names(out) <- make.names(names(out))
+  out$term <- term
+  out
+}
+
+format_p <- function(p) {
+  if (is.null(p) || is.na(p)) return("not available")
+  if (p < 0.001) return("< 0.001")
+  sprintf("%.3f", p)
+}
+
+sig_sentence <- function(p) {
+  if (is.null(p) || is.na(p)) {
+    return("The p-value is not available, so statistical significance cannot be assessed from this line alone.")
+  }
+  if (p < 0.01) {
+    return("This relationship is statistically significant at the 1 percent level.")
+  } else if (p < 0.05) {
+    return("This relationship is statistically significant at the 5 percent level.")
+  } else if (p < 0.10) {
+    return("This relationship is statistically significant at the 10 percent level.")
+  } else {
+    return("This relationship is not statistically significant at conventional levels.")
+  }
+}
+
+print_model_interpretation <- function(model, term, label, design_note) {
+  row <- get_fixest_term(model, term)
+  if (is.null(row)) {
+    cat(sprintf("\n\n**Interpretation of %s.** The coefficient named `%s` was not found in this model output, so no automated interpretation is printed.\n\n", label, term))
+    return(invisible(NULL))
+  }
+
+  beta <- as.numeric(row$Estimate[1])
+  se <- as.numeric(row$Std..Error[1])
+  pval_col <- grep("^Pr", names(row), value = TRUE)
+  pval <- if (length(pval_col) > 0) as.numeric(row[[pval_col[1]]][1]) else NA_real_
+
+  log_change_10pp <- beta * 0.10
+  percent_change_exact <- 100 * (exp(log_change_10pp) - 1)
+  direction <- ifelse(beta >= 0, "positive", "negative")
+
+  cat(sprintf(
+    "\n\n**Interpretation of %s.** The immigrant-share coefficient is %.3f with a standard error of %.3f and p-value %s. The sign is %s. Because the outcome is mean log weekly earnings, a 10 percentage-point increase in immigrant share is associated with a %.3f log-point change in weekly earnings, which is about %.2f percent. %s %s\n\n",
+    label,
+    beta,
+    se,
+    format_p(pval),
+    direction,
+    log_change_10pp,
+    percent_change_exact,
+    sig_sentence(pval),
+    design_note
+  ))
+}
+```
+
+
+
+
+```{r}
+
+# 1. LOAD DATA
+# -----------------------------------------------------------------------------
+# two data sources:
+#   (a) cps_state_year.csv  - already-aggregated state x year panel
+#                             (produced by 01_clean.R) Built during the stage 2(Exploratory analysis)
+#   (b) cps_00004.csv       - raw CPS precisely the BPL / birthplace is not in the cleaned file) this needed to instrument
+state_yr <- read_csv("cps_state_year.csv", col_types = cols())
+raw      <- read_csv("cps_00004.csv",      col_types = cols())
+ 
+glimpse(state_yr)    # 153 rows = 51 states x 3 years
+
+```
+
+```{r}
+# =============================================================================
+# 2. BUILD THE SHIFT-SHARE INSTRUMENT
+# =============================================================================
+# Step 2a: Define the top 10 non-European origin countries by BPL code.
+# Step 2b: Compute base-year (2000) distribution across states.
+# Step 2c: Compute national growth factors (2010 and 2020 vs. 2000).
+# Step 2d: Combine to produce the predicted immigrant share.
+
+
+# ── 2a: BPL codes for the top 10 non-European origin countries ──────────────
+#   These are IPUMS BPL (birthplace) codes for the 10 largest non-European
+#   immigrant source countries in the US (based on 2000 CPS data):
+#   Mexico, Cuba, Dominican Republic, Caribbean Other, South Korea,
+#   Philippines, West Indies (Jamaica/Haiti area), Trinidad & Tobago,
+#   China, El Salvador.
+
+top10_bpl <- c(
+  20000,   # Mexico
+  51500,   # Cuba
+  52100,   # Dominican Republic
+  50000,   # Caribbean (aggregated code)
+  21030,   # South Korea
+  25000,   # Philippines
+  51800,   # West Indies (Jamaica/Haiti area)
+  50220,   # Trinidad & Tobago
+  26010,   # China
+  30025    # El Salvador
+)
+# Country name labels: This is just for clarity
+bpl_labels <- c(
+  "20000" = "Mexico",
+  "51500" = "Cuba",
+  "52100" = "Dominican Republic",
+  "50000" = "Caribbean (Other)",
+  "21030" = "South Korea",
+  "25000" = "Philippines",
+  "51800" = "West Indies",
+  "50220" = "Trinidad & Tobago",
+  "26010" = "China",
+  "30025" = "El Salvador"
+)
+```
+
+
+```{r}
+# ── 2b: I am going to restrict the raw data to the working-age employed population ───────────── that is, ALL employed working-age adults to:
+#     (i)  count immigrants by origin (numerator of the instrument)
+#     (ii) count total workers per state (denominator)
+#   NOTE: No earnings restriction here - want the full workforce,
+#         not just people who report wages.
+class(raw)
+cps_workers <- raw |>
+   dplyr::filter(
+    YEAR %in% c(2000, 2010, 2020),
+    between(AGE, 25, 64),
+    EMPSTAT %in% c(10, 12),   # employed
+    ASECWT > 0,               # positive survey weight
+    !is.na(STATEFIP),
+    STATEFIP <= 56            # 50 states + DC only
+  ) |>
+  dplyr::rename(
+    year       = YEAR,
+    state_fips = STATEFIP,
+    bpl        = BPL,
+    nativity   = NATIVITY,
+    weight     = ASECWT
+  ) |>
+  dplyr::select(year, state_fips, bpl, nativity, weight)
+
+cat("Total worker observations (2000-2020):", nrow(cps_workers), "\n")
+
+```
+
+```{r}
+# ── 2c: Base-year (2000) state-by-origin distribution ───────────────────────
+#   For each state, compute the weighted count of immigrants from each
+#   of the top 10 origin countries.
+#   Also compute total employed workers per state in 2000 (the denominator).
+
+# Base year: 2000
+base_year <- 2000
+
+# Total employed workers in each state in 2000 (denominator):
+total_workers_2000 <- cps_workers |>
+  filter(year == base_year) |>
+  group_by(state_fips) |>
+  summarise(n_total_2000 = sum(weight), .groups = "drop")
+
+# Immigrants from each top-10 origin, by state, in 2000 (numerator):
+state_origin_2000 <- cps_workers |>
+  filter(
+    year    == base_year,
+    bpl     %in% top10_bpl      # only the 10 origin countries
+  ) |>
+  group_by(state_fips, bpl) |>
+  summarise(n_origin_state_2000 = sum(weight), .groups = "drop")
+
+# Combine to get the initial-share for each state x origin:
+#   share_{s,o,2000} = n_{s,o,2000} / N_{s,2000}
+base_shares <- state_origin_2000 |>
+  left_join(total_workers_2000, by = "state_fips") |>
+  mutate(
+    share_so_2000 = n_origin_state_2000 / n_total_2000
+  )
+
+glimpse(base_shares)
+# Should have rows: 51 states x up to 10 origins = up to 510 rows
+
+# ── 2d: National growth factors ─────────────────────────────────────────────
+#   National counts of immigrants from each origin country in each year.
+#   Growth factor = N_{national, t, o} / N_{national, 2000, o}
+
+national_origin <- cps_workers |>
+  filter(bpl %in% top10_bpl) |>
+  group_by(year, bpl) |>
+  summarise(n_national = sum(weight), .groups = "drop")
+
+# Base year national counts:
+national_2000 <- national_origin |>
+  filter(year == base_year) |>
+  rename(n_national_2000 = n_national) |>
+  select(bpl, n_national_2000)
+
+# Merge and compute growth factors:
+national_growth <- national_origin |>
+  left_join(national_2000, by = "bpl") |>
+  mutate(
+    growth_factor = n_national / n_national_2000
+  )
+
+# Quick sanity check - growth factors for 2000 should all equal 1:
+national_growth |>
+  filter(year == 2000) |>
+  pull(growth_factor) |>
+  summary()
+
+
+# ── 2e: Construct the shift-share (Bartik) instrument ───────────────────────
+#   z_{s,t} = sum_o [ share_{s,o,2000} x growth_{o,t} ]
+#
+#   This is the PREDICTED immigrant share for state s in year t,
+#   based solely on base-year settlement patterns and national inflows.
+
+shift_share <- base_shares |>
+  left_join(national_growth, by = "bpl") |>
+  mutate(
+    contribution = share_so_2000 * growth_factor   # each origin's contribution
+  ) |>
+  group_by(state_fips, year) |>
+  summarise(
+    iv_immigrant_share = sum(contribution, na.rm = TRUE),  # the instrument
+    .groups = "drop"
+  )
+
+# Preview the instrument by year:
+shift_share |>
+  group_by(year) |>
+  summarise(
+    mean_iv = mean(iv_immigrant_share),
+    sd_iv   = sd(iv_immigrant_share)
+  )
+
+# ── 2f: Merge instrument into the state x year panel ─────────────────────────
+
+state_yr <- state_yr |>
+  left_join(shift_share, by = c("state_fips", "year"))
+
+# Check: no state should be missing the instrument for 2010/2020
+state_yr |>
+  filter(year != 2000, is.na(iv_immigrant_share)) |>
+  select(state_abb, year, iv_immigrant_share)
+
+# For year 2000, the instrument = the actual base-year share (by construction).
+# We use the instrument only as a predictor in 2SLS - this is fine.
+
+# The 2000 observations are the "base" - the panel variation comes from
+# changes relative to 2000, which is why we use year fixed effects.
+
+glimpse(state_yr)
+cat("\nState x year cells with instrument:", sum(!is.na(state_yr$iv_immigrant_share)), "\n")
+
+```
+
+
+```{r}
+# 3. ADDITIONAL CONTROL VARIABLES
+# --------------------------------------------------
+# Beyond what is already in the panel, we should control for:
+#   (1) year fixed effects - absorb nationwide trends (recessions, etc.)
+#   (2) state fixed effects - absorb time-invariant state characteristics
+#   (3) share_college - education composition of the workforce
+#   (4) share_female  - gender composition
+#   (5) mean_age      - age composition
+#   (6) log(n_weighted) - log workforce size (controls for state scale effects)
+#
+# These controls are already in cps_state_year.csv from the cleaning script.
+# We add log workforce size now:
+
+state_yr <- state_yr |>
+  mutate(
+    ln_workforce  = log(n_weighted),   # log total employed workers in state-year
+    year_f        = factor(year),      # year as factor for fixed effects
+    state_f       = factor(state_fips) # state as factor for fixed effects
+  )
+
+# Verify no infinite/NaN values:
+state_yr |>
+  summarise(
+    n_inf_earn = sum(is.infinite(mean_ln_earn)),
+    n_inf_work = sum(is.infinite(ln_workforce)),
+    n_na_iv    = sum(is.na(iv_immigrant_share))
+  )
+
+
+```
+
+
+## Regression models
+
+The regression section estimates whether states with higher immigrant shares also have different average weekly earnings. The outcome is mean log weekly earnings, so coefficients can be read approximately as percentage changes after multiplying by 100. Since immigrant share ranges from 0 to 1, I interpret the main coefficient using a 10 percentage-point increase.
+
+```{r}
+# 4. REGRESSION MODELS
+# -----------------------------------
+#
+# RESEARCH QUESTION:
+#   Is there a descriptive association between the share of immigrants in a
+#   state's workforce and average wages in that state?
+#
+# THREE MODELS (from simple to more rigorous):
+#
+#   Model 1 - Cross-Sectional OLS (one year at a time, 2020 only)
+#     Baseline: what does the raw correlation look like within a single year?
+#     Limitation: ignores state fixed effects; confounded by time-invariant
+#     state characteristics (e.g., California is both high-wage and high-immigration).
+#
+#   Model 2 - Panel OLS with State + Year Fixed Effects
+#     Exploits WITHIN-STATE variation over time.
+#     "Controlling for everything that is constant within a state"
+#     Limitation: still endogenous - both immigrant share and wages may respond
+#     to the same unobserved economic shocks.
+#
+#   Model 3 - 2SLS IV with Shift-Share Instrument
+#     Uses predicted immigrant share (from base-year settlement patterns x
+#     national growth) as an instrument for actual immigrant share.
+#     This isolates variation driven by historical settlement + national pushes,
+#     not local wage conditions.
+#     Still includes state + year fixed effects.
+#
+
+
+# ── Model 1: Cross-sectional OLS (2020 only) ─────────────────────────────────
+#
+#   Equation:
+#     mean_ln_earn_{s} = β0 + β1 x immigrant_share_{s}
+#                       + β2 x share_college_{s} + β3 x share_female_{s}
+#                       + β4 x mean_age_{s} + ε_{s}
+#
+#   Interpretation of β1:
+#     A one-unit increase in immigrant share (i.e., going from 0% to 100%
+#     immigrant workforce) is associated with a β1 change in mean log weekly
+#     earnings. In practice we report this as: a 10 percentage-point increase
+#     in immigrant share is associated with a 0.1xβ1 change.
+
+m1 <- feols(
+  mean_ln_earn ~ immigrant_share + share_college + share_female + mean_age,
+  data   = state_yr |> filter(year == 2020),
+  vcov   = "HC1"    # heteroskedasticity-robust standard errors
+)
+
+summary(m1)
+
+```
+
+```{r model-1-explanation, results='asis'}
+print_model_interpretation(
+  m1,
+  "immigrant_share",
+  "Model 1 - OLS cross-section for 2020",
+  "This model compares states only in 2020. It is useful as a descriptive cross-state correlation, but it should not be interpreted causally because states differ in many persistent ways such as industry mix, cost of living, and long-run wage levels."
+)
+```
+
+```{r}
+# ── Model 2: Panel OLS with State + Year Fixed Effects ───────────────────────
+#
+#   Equation:
+#     mean_ln_earn_{st} = α_s + γ_t
+#                        + β1 x immigrant_share_{st}
+#                        + β2 x share_college_{st} + β3 x share_female_{st}
+#                        + β4 x mean_age_{st} + ε_{st}
+#
+#   α_s = state fixed effect (absorbs time-invariant state characteristics)
+#   γ_t = year fixed effect  (absorbs nationwide trends)
+#
+#   Interpretation of β1:
+#     Within the same state over time, a 10 pp increase in the immigrant
+#     share is associated with a 0.1xβ1 change in mean log wages.
+#
+#   NOTE: feols() from fixest handles two-way FE very efficiently.
+#         The | state_f + year_f syntax means "absorb these as fixed effects"
+
+m2 <- feols(
+  mean_ln_earn ~ immigrant_share + share_college + share_female + mean_age
+                 | state_f + year_f,    # state FE + year FE
+  data   = state_yr,
+  vcov   = ~state_f                    # cluster SE at state level (accounts for
+                                        # within-state serial correlation)
+)
+
+summary(m2)
+```
+
+```{r model-2-explanation, results='asis'}
+print_model_interpretation(
+  m2,
+  "immigrant_share",
+  "Model 2 - Panel OLS with state and year fixed effects",
+  "This model is stronger than Model 1 because it compares changes within the same state over time while controlling for national year shocks. However, it may still be biased if local wage shocks also affect immigrant settlement patterns."
+)
+```
+
+
+```{r}
+# ── Model 3: 2SLS IV with Shift-Share Instrument + State + Year FE ───────────
+#
+#   First Stage (instrument relevance):
+#     immigrant_share_{st} = α_s + γ_t
+#                           + δ x iv_immigrant_share_{st}
+#                           + controls + u_{st}
+#
+#   Second Stage (structural equation):
+#     mean_ln_earn_{st} = α_s + γ_t
+#                        + β1 x immigrant_share_hat_{st}
+#                        + controls + ε_{st}
+#
+#   The instrument iv_immigrant_share is the shift-share predicted share.
+#
+#   VALIDITY REQUIREMENTS:
+#     (i)  Relevance: iv_immigrant_share correlates with actual immigrant_share.
+#          CHECK: F-statistic on first stage should be > 10 (rule of thumb).
+#     (ii) Exclusion restriction: iv_immigrant_share affects wages ONLY
+#          through immigrant_share, not through any other channel.
+#          This is ASSUMED, not tested - a key limitation we discuss.
+#
+#   In fixest, 2SLS syntax is:
+#     feols(Y ~ controls | FE | endogenous ~ instrument)
+
+m3 <- feols(
+  mean_ln_earn ~ share_college + share_female + mean_age
+                 | state_f + year_f                       # fixed effects
+                 | immigrant_share ~ iv_immigrant_share,  # IV: endogenous ~ instrument
+  data   = state_yr,
+  vcov   = ~state_f     # cluster SE at state level
+)
+
+summary(m3)
+
+# Check first-stage F-statistic (printed automatically by fixest):
+# A value >> 10 indicates a strong instrument (no weak instrument problem).
+fitstat(m3, ~ ivfall)   # IV first-stage F-statistic
+```
+
+```{r model-3-explanation, results='asis'}
+print_model_interpretation(
+  m3,
+  "fit_immigrant_share",
+  "Model 3 - 2SLS IV with state and year fixed effects",
+  "This model uses the shift-share predicted immigrant share as an instrument. The estimate should be read as the wage association coming from instrument-driven changes in immigrant share, not from all observed immigrant-share changes."
+)
+
+cat("\n\n**First-stage interpretation.** The first-stage test printed above checks whether the shift-share instrument strongly predicts actual immigrant share. A first-stage F-statistic above 10 is commonly treated as evidence that the instrument is relevant. In this output, the first-stage F-statistic is above that benchmark, so the instrument appears relevant. This does not prove the exclusion restriction; it only supports the relevance condition.\n\n")
+
+```
+
+
+```{r regression-table, results='asis'}
+# 5. REGRESSION TABLE
+# -----------------------------------
+# We use modelsummary() to produce a single table showing all three models.
+# The table shows:
+#   - Coefficient estimates
+#   - Standard errors in parentheses
+#   - Stars for statistical significance
+#   - Goodness-of-fit statistics at the bottom
+library(modelsummary)
+# Tidy coefficient names for the table:
+coef_map <- c(
+  "immigrant_share"    = "Immigrant Share",
+  "fit_immigrant_share" = "Immigrant Share (IV)",   # 2SLS fitted value label
+  "share_college"      = "Share College+",
+  "share_female"       = "Share Female",
+  "mean_age"           = "Mean Age"
+)
+
+# Model labels:
+model_names <- c(
+  "(1) OLS Cross-Section 2020",
+  "(2) OLS Panel (FE)",
+  "(3) 2SLS IV (FE)"
+)
+
+# Additional rows showing what is controlled for:
+add_rows <- tribble(
+  ~term,              ~`(1) OLS Cross-Section 2020`, ~`(2) OLS Panel (FE)`, ~`(3) 2SLS IV (FE)`,
+  "State FE",         "No",                           "Yes",                  "Yes",
+  "Year FE",          "No",                           "Yes",                  "Yes",
+  "Instrument",       "-",                            "-",                    "Shift-Share (10 origins)"
+)
+
+# Build the table:
+reg_table <- modelsummary(
+  models      = list(m1, m2, m3),
+  coef_map    = coef_map,
+  add_rows    = add_rows,
+  gof_map     = list(
+    list(raw = "nobs",          clean = "Observations", fmt = 0),
+    list(raw = "r.squared",     clean = "R2",           fmt = 3),
+    list(raw = "adj.r.squared", clean = "Adj. R2",      fmt = 3)
+  ),
+  stars       = c("*" = 0.1, "**" = 0.05, "***" = 0.01),
+  title       = "Table 1. Immigrant Share and Mean Log Weekly Wages - State-Level Panel",
+  notes       = paste(
+    "Outcome variable: mean log weekly earnings of employed workers aged 25-64 in each state-year.",
+    "Standard errors are HC1-robust in Model 1 and clustered by state in Models 2-3.",
+    "The shift-share instrument uses 2000 as the base year and the top 10 non-European",
+    "immigrant-origin countries: Mexico, Cuba, Dominican Republic, Caribbean Other,",
+    "South Korea, Philippines, West Indies, Trinidad and Tobago, China, El Salvador.",
+    sep = "\n"
+  ),
+  output      = "kableExtra"
+)
+
+
+# Show the regression table in the knitted report.
+# The chunk header uses results='asis', so the table renders properly
+# instead of appearing as raw HTML code.
+reg_table
+
+
+```
+
+### Explanation of Table 1
+
+Table 1 places the three regression models side by side. Model 1 is a simple cross-sectional comparison across states in 2020. Model 2 adds state and year fixed effects, so it focuses on changes within the same state over time. Model 3 uses the shift-share instrument to isolate variation in immigrant share that is predicted by historical settlement patterns and national origin-country growth.
+
+The key row is **Immigrant Share** in Models 1 and 2, and **Immigrant Share (IV)** in Model 3. A positive coefficient means higher immigrant share is associated with higher mean log weekly earnings. A negative coefficient means higher immigrant share is associated with lower mean log weekly earnings. Since the dependent variable is in logs, multiplying the coefficient by 0.10 gives the approximate log-wage change associated with a 10 percentage-point increase in immigrant share.
+
+The table shows that the simple 2020 cross-sectional estimate is small and not statistically significant, while the panel fixed-effects and IV estimates are negative and statistically significant. This means the conclusion changes once the analysis compares states over time and uses the instrument. The strongest interpretation is not that immigration mechanically lowers wages everywhere, but that in this state-level panel, increases in immigrant share are associated with lower mean log weekly earnings after using the fixed-effects and IV designs.
+
+```{r}
+# 6. FIRST STAGE VISUALIZATION
+# --------------------------------------------------
+# A scatter plot of the instrument vs. actual immigrant share.
+# A strong first stage means these should be highly correlated.
+
+first_stage_data <- state_yr |>
+  filter(year != 2000, !is.na(iv_immigrant_share)) |>
+  mutate(year_f = factor(year))
+
+fig_fs <- ggplot(first_stage_data,
+                 aes(x = iv_immigrant_share, y = immigrant_share,
+                     color = year_f)) +
+  geom_point(alpha = 0.7, size = 2) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 0.8) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+              color = "gray50", linewidth = 0.5) +
+  geom_text_repel(
+    data = first_stage_data |>
+      filter(state_abb %in% c("CA", "TX", "NY", "FL", "MT", "ND")),
+    aes(label = state_abb),
+    size = 2.8, show.legend = FALSE, max.overlaps = 15
+  ) +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_color_brewer(palette = "Set1", name = "Year") +
+  labs(
+    title    = "Figure 5. First Stage: Shift-Share Instrument vs. Actual Immigrant Share",
+    subtitle  = paste(
+      "Each point = one state-year. Strong correlation validates instrument relevance.",
+      "Dashed 45-degree line = perfect prediction."
+    ),
+    x        = "Predicted Immigrant Share (Shift-Share Instrument)",
+    y        = "Actual Immigrant Share",
+    caption  = paste(
+      "Source: IPUMS CPS.",
+      "Instrument = shift-share predicted share using 2000 base year and",
+      "top 10 non-European origin countries.",
+      sep = " "
+    )
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 13),
+    plot.subtitle = element_text(color = "gray40", size = 10),
+    plot.caption  = element_text(color = "gray50", size = 8, hjust = 0),
+    legend.position = "bottom"
+  )
+
+
+
+ggsave("fig5_first_stage.png", fig_fs, width = 8, height = 6, dpi = 150)
+
+cat("Figure 5 saved.\n")
+print(fig_fs)
+
+```
+
+### Explanation of Figure 5
+
+Figure 5 checks the **first stage** of the IV strategy. The horizontal axis shows the predicted immigrant share from the shift-share instrument, while the vertical axis shows the actual immigrant share. If the instrument is relevant, states with higher predicted immigrant shares should also tend to have higher actual immigrant shares.
+
+The upward-sloping fitted lines indicate that the instrument is positively related to actual immigrant share. This supports the relevance condition for the IV approach. The dashed 45-degree line is a benchmark for perfect prediction; points do not need to lie exactly on this line, but a clear positive relationship is important. The graph therefore provides visual evidence that the instrument is informative, while the first-stage F-statistic provides the formal numerical check.
+
+```{r}
+# -------------------------------------------------------
+# 7. COEFFICIENT PLOT (Visual summary of the three models)
+# ------------------------------------------
+# A dot-and-whisker plot makes it easy to compare the immigrant share
+# coefficient across the three models.
+
+coef_plot_data <- bind_rows(
+  # Model 1: OLS cross-section
+  broom::tidy(m1, conf.int = TRUE) |>
+    filter(term == "immigrant_share") |>
+    mutate(model = "(1) OLS Cross-Section"),
+
+  # Model 2: OLS panel
+  broom::tidy(m2, conf.int = TRUE) |>
+    filter(term == "immigrant_share") |>
+    mutate(model = "(2) OLS Panel (State + Year FE)"),
+
+  # Model 3: 2SLS IV
+  broom::tidy(m3, conf.int = TRUE) |>
+    filter(term == "fit_immigrant_share") |>
+    mutate(model = "(3) 2SLS IV (State + Year FE)")
+)
+
+fig_coef <- ggplot(
+  coef_plot_data,
+  aes(x = estimate, y = model, xmin = conf.low, xmax = conf.high)
+) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_errorbarh(height = 0.2, linewidth = 0.8, color = "steelblue") +
+  geom_point(size = 4, color = "steelblue") +
+  labs(
+    title    = "Figure 6. Immigrant Share Coefficient Across Three Models",
+    subtitle = paste(
+      "Outcome: Mean Log Weekly Earnings.",
+      "Whiskers = 95% confidence intervals."
+    ),
+    x        = "Estimated Coefficient on Immigrant Share",
+    y        = NULL,
+    caption  = "Source: IPUMS CPS. SE: HC1-robust in Model 1; state-clustered in Models 2-3."
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 13),
+    plot.subtitle = element_text(color = "gray40", size = 10),
+    plot.caption  = element_text(color = "gray50", size = 8, hjust = 0)
+  )
+
+ggsave("fig6_coefficient_plot.png", fig_coef, width = 8, height = 5, dpi = 150)
+
+cat("Figure 6 saved.\n")
+print(fig_coef)
+```
+
+### Explanation of Figure 6
+
+Figure 6 summarizes the immigrant-share coefficient from the three models. The dots are the estimated coefficients, and the horizontal whiskers are the 95 percent confidence intervals. The vertical dashed line at zero is the benchmark for no association.
+
+If a confidence interval crosses zero, the estimate is not statistically distinguishable from zero at the 5 percent level. If the interval is fully to the left of zero, the estimate is statistically negative; if it is fully to the right, the estimate is statistically positive. In this figure, Model 1 is close to zero, while Models 2 and 3 move to the negative side. This visual pattern reinforces the table: the estimated relationship becomes more negative after adding fixed effects and using the IV strategy.
+
+```{r numerical-interpretation, results='asis'}
+# ---------------------------------------------------------
+# 8. NUMERICAL INTERPRETATION
+# -------------------------------------------------------
+
+coef_m1 <- coef(m1)["immigrant_share"]
+coef_m2 <- coef(m2)["immigrant_share"]
+coef_m3 <- coef(m3)["fit_immigrant_share"]
+
+cat("\n\n## Summary interpretation\n\n")
+
+cat(sprintf(
+  "**Model 1: OLS Cross-Section, 2020 only.** A 10 percentage-point higher immigrant share is associated with a %.4f change in mean log weekly wages. This is about %.1f percent using the log-point approximation. This estimate is descriptive and not statistically significant in the regression output.\n\n",
+  coef_m1 * 0.10,
+  coef_m1 * 0.10 * 100
+))
+
+cat(sprintf(
+  "**Model 2: Panel OLS with state and year fixed effects.** Within a given state over time, a 10 percentage-point increase in immigrant share is associated with a %.4f change in mean log weekly wages. This is about %.1f percent using the log-point approximation. This estimate is negative and statistically significant in the regression output.\n\n",
+  coef_m2 * 0.10,
+  coef_m2 * 0.10 * 100
+))
+
+cat(sprintf(
+  "**Model 3: 2SLS IV with state and year fixed effects.** Using variation in immigrant share predicted by historical settlement patterns and national origin-group growth, a 10 percentage-point increase in immigrant share is associated with a %.4f change in mean log weekly wages. This is about %.1f percent using the log-point approximation. This estimate is negative and statistically significant in the regression output.\n\n",
+  coef_m3 * 0.10,
+  coef_m3 * 0.10 * 100
+))
+
+cat("Overall, the results suggest that the simple cross-sectional relationship is weak, but the fixed-effects and IV specifications show a negative association between immigrant share and mean log weekly earnings. Not really a not definitive causation, because the IV exclusion restriction cannot be directly tested.\n\n")
+```
+
